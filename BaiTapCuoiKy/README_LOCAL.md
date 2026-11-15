@@ -47,12 +47,12 @@ Nếu dataset nằm ở nơi khác, truyền đường dẫn khi huấn luyện:
 .\.venv\Scripts\python.exe nhom19.py
 ```
 
-Chương trình tự chọn CUDA khi khả dụng. Lần đầu tải trọng số ImageNet và trích xuất ảnh; cache được lưu trong `outputs/cache/`. Các lần sau dùng lại cache. Mặc định dùng ResNet18, không thêm lượt augmentation để tiết kiệm thời gian.
+Chương trình tự chọn CUDA khi khả dụng. Lần đầu tải trọng số ImageNet và trích xuất ảnh; cache được lưu trong `outputs/cache/`. Các lần sau dùng lại cache. Mặc định dùng ResNet50 và tạo 2 ảnh augmentation bổ sung cho mỗi ảnh train.
 
-Để dùng ResNet50 hoặc augmentation:
+Tuỳ chọn dùng ResNet18 hoặc đổi số lượt augmentation:
 
 ```powershell
-.\.venv\Scripts\python.exe nhom19.py --backbone resnet50 --augment 1
+.\.venv\Scripts\python.exe nhom19.py --backbone resnet18 --augment 1
 ```
 
 Muốn trích xuất lại đặc trưng (ví dụ sau khi đổi từ CPU sang GPU):
@@ -61,7 +61,7 @@ Muốn trích xuất lại đặc trưng (ví dụ sau khi đổi từ CPU sang 
 .\.venv\Scripts\python.exe nhom19.py --force-features
 ```
 
-`train/` được dùng để huấn luyện và chọn K bằng Stratified 5-fold cross-validation; `valid/` được giữ nguyên để đánh giá cuối. `test/` không có nhãn nên chỉ dùng chạy demo dự đoán. Đồ thị và bảng điểm chọn K được lưu tại `outputs/knn_chon_k_cv.png` và `outputs/knn_chon_k_cv.csv`.
+`train/` được dùng để huấn luyện và chọn K bằng Stratified 5-fold cross-validation; `valid/` được giữ nguyên để đánh giá cuối. Các augmentation của cùng một ảnh luôn nằm trong cùng fold, và mỗi fold chỉ chấm điểm trên ảnh gốc chưa thấy. Euclidean/Manhattan dùng StandardScaler; cosine dùng chuẩn hóa L2 riêng. `test/` không có nhãn nên chỉ dùng chạy demo dự đoán. Đồ thị và bảng điểm chọn K được lưu tại `outputs/knn_chon_k_cv.png` và `outputs/knn_chon_k_cv.csv`.
 
 ## 4. Mở giao diện web
 

@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -40,7 +41,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, normalize
 from sklearn.linear_model import SGDClassifier
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
@@ -61,11 +62,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Huấn luyện và đánh giá phân loại hoa Oxford 102")
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA,
                         help="Thư mục chứa train/, valid/ và cat_to_name.json")
-    parser.add_argument("--backbone", choices=("resnet18", "resnet50"), default="resnet18",
-                        help="ResNet18 chạy nhanh hơn trên CPU; ResNet50 cho phép so sánh")
+    parser.add_argument("--backbone", choices=("resnet18", "resnet50"), default="resnet50",
+                        help="ResNet50 mặc định để khớp quy trình transfer learning của đề tài")
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--augment", type=int, default=0,
-                        help="Số lượt ảnh augmentation bổ sung cho mỗi ảnh train (mặc định 0 để chạy nhanh)")
+    parser.add_argument("--augment", type=int, default=2,
+                        help="Số lượt augmentation bổ sung cho mỗi ảnh train (mặc định 2)")
     parser.add_argument("--workers", type=int, default=0,
                         help="Số tiến trình đọc ảnh; để 0 là lựa chọn ổn định trên Windows")
     parser.add_argument("--force-features", action="store_true",
@@ -238,13 +239,13 @@ def load_or_extract(args, train, test, device):
     )
     data_signature = hashlib.sha1(signature_source.encode("utf-8")).hexdigest()[:10]
     cache_path = cache_dir / (
-        f"features_cv5_{args.backbone}_size{IMAGE_SIZE}_aug{args.augment}_{data_signature}.npz"
+        f"features_groupcv5_{args.backbone}_size{IMAGE_SIZE}_aug{args.augment}_{data_signature}.npz"
     )
 
     if cache_path.exists() and not args.force_features:
         cached = np.load(cache_path)
         print(f"Dùng cache đặc trưng: {cache_path}")
-        keys = ("X_train", "y_train", "X_cv", "y_cv", "X_test", "y_test")
+        keys = ("X_train", "y_train", "groups_train", "X_cv", "y_cv", "X_test", "y_test")
         return tuple(cached[k] for k in keys), model
 
     start = time.time()
@@ -252,27 +253,31 @@ def load_or_extract(args, train, test, device):
     # phiên bản augmentation của chính ảnh đó.
     X_cv, y_cv = extract_features(train, model, evaluate, device, args, "Trích xuất train")
     train_features, train_labels = [X_cv], [y_cv]
+    base_groups = np.arange(len(train), dtype=np.int32)
+    groups = [base_groups]
     for i in range(args.augment):
         x, y = extract_features(train, model, augment, device, args, f"Augmentation {i + 1}/{args.augment}")
         train_features.append(x)
         train_labels.append(y)
+        groups.append(base_groups)
 
     x_test, y_test = extract_features(test, model, evaluate, device, args, "Đánh giá")
     arrays = (
         np.concatenate(train_features), np.concatenate(train_labels),
-        X_cv, y_cv, x_test, y_test,
+        np.concatenate(groups), X_cv, y_cv, x_test, y_test,
     )
     np.savez_compressed(cache_path, X_train=arrays[0], y_train=arrays[1],
-                        X_cv=arrays[2], y_cv=arrays[3], X_test=arrays[4], y_test=arrays[5])
+                        groups_train=arrays[2], X_cv=arrays[3], y_cv=arrays[4],
+                        X_test=arrays[5], y_test=arrays[6])
     print(f"Đã lưu cache: {cache_path} ({time.time() - start:.0f} giây)")
     return arrays, model
 
 
 def fit_models(arrays):
-    X_train, y_train, X_cv, y_cv, X_test, y_test = arrays
+    X_train, y_train, groups_train, X_cv, y_cv, X_test, y_test = arrays
 
-    # Stratified 5-fold CV trên ảnh train gốc. Scaler được fit riêng trong
-    # từng fold để không đưa thống kê của fold validation vào fold train.
+    # Fold được chia theo ảnh gốc. Các phiên bản augmentation của một ảnh luôn
+    # nằm cùng fold train; validation của CV chỉ gồm ảnh gốc chưa thấy.
     k_values = np.arange(1, 30, 2)
     metrics = ("euclidean", "manhattan", "cosine")
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
@@ -285,14 +290,23 @@ def fit_models(arrays):
 
     print("\nChọn K bằng Stratified 5-fold CV (K lẻ từ 1 đến 29)...")
     for fold_index, (fit_indices, valid_indices) in enumerate(cv.split(X_cv, y_cv)):
-        fold_scaler = StandardScaler()
-        X_fold_train = fold_scaler.fit_transform(X_cv[fit_indices])
-        X_fold_valid = fold_scaler.transform(X_cv[valid_indices])
-        y_fold_train = y_cv[fit_indices]
+        train_mask = np.isin(groups_train, fit_indices)
+        X_fold_train_raw = X_train[train_mask]
+        y_fold_train = y_train[train_mask]
+        X_fold_valid_raw = X_cv[valid_indices]
         y_fold_valid = y_cv[valid_indices]
         row_indices = np.arange(len(valid_indices))
 
         for metric in metrics:
+            if metric == "cosine":
+                # Cosine similarity uses direction only; do not standardize
+                # each feature dimension before L2 normalization.
+                X_fold_train = normalize(X_fold_train_raw, norm="l2")
+                X_fold_valid = normalize(X_fold_valid_raw, norm="l2")
+            else:
+                fold_scaler = StandardScaler()
+                X_fold_train = fold_scaler.fit_transform(X_fold_train_raw)
+                X_fold_valid = fold_scaler.transform(X_fold_valid_raw)
             neighbors = KNeighborsClassifier(
                 n_neighbors=int(k_values[-1]), metric=metric, n_jobs=-1
             )
@@ -354,11 +368,17 @@ def fit_models(arrays):
           f"(CV acc = {best_cv_score:.4f})")
 
     scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
 
     knn_name = f"KNN (K={best_k}, {best_metric})"
     knn_model = KNeighborsClassifier(n_neighbors=best_k, metric=best_metric, n_jobs=-1)
+    if best_metric == "cosine":
+        X_knn_train = normalize(X_train, norm="l2")
+        X_knn_test = normalize(X_test, norm="l2")
+    else:
+        X_knn_train = X_train_scaled
+        X_knn_test = X_test_scaled
 
     models_to_score = {
         knn_name: knn_model,
@@ -376,9 +396,14 @@ def fit_models(arrays):
     results, predictions = [], {}
     for name, model in models_to_score.items():
         print(f"Huấn luyện/đánh giá: {name}")
-        model.fit(X_train, y_train)
+        if name == knn_name:
+            model.fit(X_knn_train, y_train)
+            X_eval = X_knn_test
+        else:
+            model.fit(X_train_scaled, y_train)
+            X_eval = X_test_scaled
         start = time.time()
-        prediction = model.predict(X_test)
+        prediction = model.predict(X_eval)
         elapsed = time.time() - start
         predictions[name] = prediction
         results.append({
@@ -463,6 +488,12 @@ def save_results(class_names, models_to_score, scaler, results, predictions, y_t
 
 
 def main():
+    # PowerShell/IDEs can launch Python with a legacy Windows code page.
+    # Keep Vietnamese progress messages printable during local runs.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     args = parse_args()
     if args.augment < 0:
         raise ValueError("--augment phải >= 0")
